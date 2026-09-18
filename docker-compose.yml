@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: livestock_management
+      POSTGRES_USER: postgres_admin
+      POSTGRES_PASSWORD: SecurePassword123!
+    ports: ["5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres_admin -d livestock_management"]
+      interval: 5s
+      timeout: 5s
+      retries: 102
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres_admin:SecurePassword123!@db:5432/livestock_management
+      JWT_SECRET_KEY: change-this-secret
+      ACCESS_TOKEN_EXPIRE_MINUTES: 480
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5}
+    ports: ["8000:8000"]
+    depends_on:
+      db:
+        condition: service_healthy
+  frontend:
+    build: ./frontend
+    ports: ["3000:80"]
+    depends_on: [backend]
+volumes:
+  postgres_data:
