@@ -2,31 +2,39 @@ services:
   db:
     image: postgres:15-alpine
     environment:
-      POSTGRES_DB: livestock_management
-      POSTGRES_USER: postgres_admin
-      POSTGRES_PASSWORD: SecurePassword123!
+      POSTGRES_DB: ${POSTGRES_DB:-livestock_management}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-livestock_dev_password}
     ports: ["5432:5432"]
     volumes: ["postgres_data:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres_admin -d livestock_management"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres_admin} -d ${POSTGRES_DB:-livestock_management}"]
       interval: 5s
       timeout: 5s
-      retries: 102
+      retries: 20
+
   backend:
     build: ./backend
     environment:
-      DATABASE_URL: postgresql+psycopg2://postgres_admin:SecurePassword123!@db:5432/livestock_management
-      JWT_SECRET_KEY: change-this-secret
-      ACCESS_TOKEN_EXPIRE_MINUTES: 480
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres_admin}:${POSTGRES_PASSWORD:-livestock_dev_password}@db:5432/${POSTGRES_DB:-livestock_management}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-secret-before-production}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-480}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5}
+      AI_MAX_OUTPUT_TOKENS: ${AI_MAX_OUTPUT_TOKENS:-4096}
+      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-25}
+      AI_COOLDOWN_SECONDS: ${AI_COOLDOWN_SECONDS:-2}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
     ports: ["8000:8000"]
     depends_on:
       db:
         condition: service_healthy
+
   frontend:
     build: ./frontend
     ports: ["3000:80"]
     depends_on: [backend]
+
 volumes:
   postgres_data:

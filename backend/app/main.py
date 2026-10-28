@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 import os
-from typing import Optional
+import uuid
+from typing import Optional, Literal
 
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,18 +9,23 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey, func
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey, func, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./livestock.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 SECRET = os.getenv("JWT_SECRET_KEY", "dev-secret-change-me")
 ALGORITHM = "HS256"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
+CORS_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
+ALLOW_PUBLIC_REGISTER = os.getenv("ALLOW_PUBLIC_REGISTER", "false").lower() == "true"
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
@@ -39,6 +45,7 @@ class Barn(Base):
     name = Column(String(100), nullable=False)
     capacity = Column(Integer, default=0)
     status = Column(String(30), default="trong")
+    zone = Column(String(50), default="Khu A")
 
 class Animal(Base):
     __tablename__ = "animals"
@@ -130,9 +137,28 @@ class AIRequest(Base):
     request = Column(String(4000), nullable=False)
     response = Column(String(8000), nullable=False)
     mode = Column(String(30), default="fallback")
+    model = Column(String(100), default="")
+    query_type = Column(String(40), default="analyze")
+    conversation_id = Column(String(36), default="")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(engine)
+
+# Lightweight schema migration for older demo databases.
+try:
+    barn_columns = {c["name"] for c in inspect(engine).get_columns("barns")}
+    if "zone" not in barn_columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE barns ADD COLUMN zone VARCHAR(50) DEFAULT 'Khu A'"))
+except Exception as exc:
+    print("Schema migration warning:", exc)
+
+# Additive migration for AI audit metadata; existing records are retained.
+with engine.begin() as conn:
+    ai_columns = {c['name'] for c in inspect(engine).get_columns('ai_requests')}
+    for column, default in [('model', ''), ('query_type', 'analyze'), ('conversation_id', '')]:
+        if column not in ai_columns:
+            conn.execute(text(f"ALTER TABLE ai_requests ADD COLUMN {column} VARCHAR(100) DEFAULT '{default}'"))
 
 # -------------------- Schemas --------------------
 class Login(BaseModel):
@@ -152,6 +178,7 @@ class BarnIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     capacity: int = Field(ge=0)
     status: str = "trong"
+    zone: str = Field(default="Khu A", min_length=1, max_length=50)
 
 class CareIn(BaseModel):
     animal_id: int
@@ -173,6 +200,18 @@ class RegisterIn(BaseModel):
 
 class ResetPasswordIn(BaseModel):
     username: str = Field(min_length=3, max_length=50)
+    new_password: str = Field(min_length=6, max_length=100)
+
+class UserUpdateIn(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    role: str
+    active: bool = True
+
+class AdminResetPasswordIn(BaseModel):
+    new_password: str = Field(min_length=6, max_length=100)
+
+class ChangePasswordIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=100)
     new_password: str = Field(min_length=6, max_length=100)
 
 class BarnFeedIn(BaseModel):
@@ -213,8 +252,15 @@ class ExportIn(BaseModel):
     total: float = Field(ge=0)
     customer: str = ""
 
+class AIMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=8000)
+
 class AIIn(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
+    messages: list[AIMessage] = Field(default_factory=list, max_length=10)
+    page: str = Field(default="dashboard", max_length=40)
+    conversation_id: Optional[str] = Field(default=None, pattern=r"^[a-zA-Z0-9-]{1,36}$")
 
 # -------------------- DB/Auth --------------------
 def db():
@@ -238,7 +284,7 @@ def seed(s: Session):
 
     if s.query(Barn).count() == 0:
         for i in range(1, 6):
-            s.add(Barn(name=f"Chuồng {i}", capacity=20, status="trong"))
+            s.add(Barn(name=f"Chuồng {i}", capacity=20, status="trong", zone=f"Khu {chr(64 + ((i-1)%3)+1)}"))
         s.commit()
 
     if s.query(FeedType).count() == 0:
@@ -260,12 +306,14 @@ def seed(s: Session):
 
 def refresh_barn_status(s: Session):
     for b in s.query(Barn).all():
-        count = s.query(Animal).filter(Animal.barn_id == b.id, Animal.status != "da_xoa").count()
+        count = s.query(Animal).filter(Animal.barn_id == b.id, Animal.status == "dang_nuoi").count()
         b.status = "dang_nuoi" if count else "trong"
     s.commit()
 
-with SessionLocal() as s:
-    seed(s)
+# Disable demo seeding when verifying an existing database; no business-data writes at startup.
+if os.getenv("SEED_DEMO_DATA", "true").lower() == "true":
+    with SessionLocal() as s:
+        seed(s)
 
 def auth(token: str, s: Session):
     try:
@@ -286,7 +334,13 @@ def role(user, allowed):
 
 # -------------------- App --------------------
 app = FastAPI(title="Smart Livestock API", version="2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
+    allow_credentials=False if CORS_ORIGINS == ["*"] else True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def root():
@@ -298,6 +352,8 @@ def health():
 
 @app.post("/api/auth/register")
 def register(x:RegisterIn, s:Session=Depends(db)):
+    if not ALLOW_PUBLIC_REGISTER:
+        raise HTTPException(403, "Đăng ký công khai đã tắt. Vui lòng liên hệ Admin để tạo tài khoản.")
     username=x.username.strip()
     if s.query(User).filter_by(username=username).first():
         raise HTTPException(400,"Tên đăng nhập đã tồn tại")
@@ -307,12 +363,13 @@ def register(x:RegisterIn, s:Session=Depends(db)):
     s.add(u); s.commit(); s.refresh(u)
     return {"message":"Đăng ký tài khoản thành công","user":{"id":u.id,"name":u.name,"username":u.username,"role":u.role}}
 
-@app.post("/api/auth/reset-password")
-def reset_password(x:ResetPasswordIn, s:Session=Depends(db)):
-    u=s.query(User).filter_by(username=x.username.strip()).first()
-    if not u: raise HTTPException(404,"Không tìm thấy tài khoản")
-    u.password_hash=pwd.hash(x.new_password); s.commit()
-    return {"message":"Đã đặt lại mật khẩu. Hãy đăng nhập bằng mật khẩu mới."}
+@app.post("/api/auth/change-password")
+def change_password(x:ChangePasswordIn, user=Depends(current), s:Session=Depends(db)):
+    if not pwd.verify(x.current_password, user.password_hash):
+        raise HTTPException(400, "Mật khẩu hiện tại không đúng")
+    user.password_hash = pwd.hash(x.new_password)
+    s.commit()
+    return {"message":"Đổi mật khẩu thành công"}
 
 @app.post("/api/auth/login")
 def login(x: Login, s: Session = Depends(db)):
@@ -321,33 +378,76 @@ def login(x: Login, s: Session = Depends(db)):
         raise HTTPException(401, "Sai tài khoản hoặc mật khẩu")
     if not u.active:
         raise HTTPException(401, "Tài khoản đã bị khóa")
-    token = jwt.encode({"sub": str(u.id), "role": u.role, "exp": datetime.utcnow()+timedelta(hours=8)}, SECRET, algorithm=ALGORITHM)
+    token = jwt.encode({"sub": str(u.id), "role": u.role, "exp": datetime.utcnow()+timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)}, SECRET, algorithm=ALGORITHM)
     return {"access_token": token, "token_type": "bearer", "user": {"id":u.id,"name":u.name,"username":u.username,"role":u.role}}
 
 @app.get("/api/auth/me")
 def me(user=Depends(current)):
     return {"id":user.id,"name":user.name,"username":user.username,"role":user.role,"active":user.active}
 
+@app.get("/api/users")
+def list_users(user=Depends(current), s:Session=Depends(db)):
+    role(user, [])
+    return [{"id":u.id,"name":u.name,"username":u.username,"role":u.role,"active":u.active} for u in s.query(User).order_by(User.id).all()]
+
+@app.post("/api/users")
+def create_user(x:RegisterIn, user=Depends(current), s:Session=Depends(db)):
+    role(user, [])
+    username=x.username.strip()
+    if s.query(User).filter_by(username=username).first():
+        raise HTTPException(400,"Tên đăng nhập đã tồn tại")
+    allowed={"Admin","NhanVienTrai","KyThuatVien","NhanVienXuatBan"}
+    if x.role not in allowed: raise HTTPException(400,"Vai trò không hợp lệ")
+    u=User(name=x.name.strip(),username=username,password_hash=pwd.hash(x.password),role=x.role,active=True)
+    s.add(u); s.commit(); s.refresh(u)
+    return {"message":"Đã tạo tài khoản","user":{"id":u.id,"name":u.name,"username":u.username,"role":u.role,"active":u.active}}
+
+@app.put("/api/users/{id}")
+def update_user(id:int, x:UserUpdateIn, user=Depends(current), s:Session=Depends(db)):
+    role(user, [])
+    u=s.get(User,id)
+    if not u: raise HTTPException(404,"Không tìm thấy tài khoản")
+    allowed={"Admin","NhanVienTrai","KyThuatVien","NhanVienXuatBan"}
+    if x.role not in allowed: raise HTTPException(400,"Vai trò không hợp lệ")
+    if u.id == user.id and not x.active:
+        raise HTTPException(400,"Không thể tự khóa tài khoản đang đăng nhập")
+    u.name=x.name.strip(); u.role=x.role; u.active=x.active
+    s.commit()
+    return {"message":"Đã cập nhật tài khoản"}
+
+@app.post("/api/users/{id}/reset-password")
+def admin_reset_password(id:int, x:AdminResetPasswordIn, user=Depends(current), s:Session=Depends(db)):
+    role(user, [])
+    u=s.get(User,id)
+    if not u: raise HTTPException(404,"Không tìm thấy tài khoản")
+    u.password_hash=pwd.hash(x.new_password)
+    s.commit()
+    return {"message":"Đã đặt lại mật khẩu cho tài khoản"}
+
 @app.get("/api/dashboard")
 def dashboard(user=Depends(current), s: Session=Depends(db)):
-    total = s.query(Animal).filter(Animal.status != "da_xoa").count()
+    total = s.query(Animal).filter(Animal.status == "dang_nuoi").count()
     barns = s.query(Barn).count()
     occupied = s.query(Barn).filter_by(status="dang_nuoi").count()
-    sick = s.query(Animal).filter(Animal.health != "binh_thuong", Animal.status != "da_xoa").count()
+    sick = s.query(Animal).filter(Animal.health != "binh_thuong", Animal.status == "dang_nuoi").count()
     revenue = s.query(func.coalesce(func.sum(ExportBill.total),0)).scalar() or 0
-    return {"total_animals":total,"total_barns":barns,"occupied_barns":occupied,"sick_animals":sick,"occupancy_rate":round(occupied/barns*100,2) if barns else 0,"revenue":float(revenue)}
+    now = datetime.utcnow()
+    upcoming_vaccines = s.query(Vaccination).filter(Vaccination.status=="chua_tiem", Vaccination.scheduled_at >= now, Vaccination.scheduled_at <= now + timedelta(days=7)).count()
+    overdue_vaccines = s.query(Vaccination).filter(Vaccination.status=="chua_tiem", Vaccination.scheduled_at < now).count()
+    low_feed = s.query(FeedType).filter(FeedType.active==True, FeedType.stock < 50).count()
+    return {"total_animals":total,"total_barns":barns,"occupied_barns":occupied,"sick_animals":sick,"occupancy_rate":round(occupied/barns*100,2) if barns else 0,"revenue":float(revenue),"upcoming_vaccines":upcoming_vaccines,"overdue_vaccines":overdue_vaccines,"low_feed_types":low_feed}
 
 # -------------------- Generic serializers --------------------
 def animal_out(a):
     return {"id":a.id,"code":a.code,"species":a.species,"origin":a.origin,"weight":a.weight,"health":a.health,"status":a.status,"barn_id":a.barn_id,"created_at":a.created_at}
 
 def barn_out(b):
-    return {"id":b.id,"name":b.name,"capacity":b.capacity,"status":b.status}
+    return {"id":b.id,"name":b.name,"capacity":b.capacity,"status":b.status,"zone":getattr(b,"zone","Khu A")}
 
 # -------------------- Barn CRUD --------------------
 @app.get("/api/barns")
 def list_barns(user=Depends(current), s:Session=Depends(db)):
-    return [barn_out(b) | {"animal_count":s.query(Animal).filter(Animal.barn_id==b.id, Animal.status!="da_xoa").count()} for b in s.query(Barn).order_by(Barn.id).all()]
+    return [barn_out(b) | {"animal_count":s.query(Animal).filter(Animal.barn_id==b.id, Animal.status=="dang_nuoi").count()} for b in s.query(Barn).order_by(Barn.id).all()]
 
 @app.post("/api/barns")
 def add_barn(x:BarnIn,user=Depends(current),s:Session=Depends(db)):
@@ -371,7 +471,7 @@ def delete_barn(id:int,user=Depends(current),s:Session=Depends(db)):
 # -------------------- Animal CRUD --------------------
 @app.get("/api/animals")
 def list_animals(keyword:Optional[str]=None,status:Optional[str]=None,page:int=Query(1,ge=1),limit:int=Query(20,ge=1,le=100),user=Depends(current),s:Session=Depends(db)):
-    q=s.query(Animal).filter(Animal.status!="da_xoa")
+    q=s.query(Animal).filter(Animal.status=="dang_nuoi")
     if keyword: q=q.filter((Animal.code.ilike(f"%{keyword}%"))|(Animal.origin.ilike(f"%{keyword}%"))|(Animal.species.ilike(f"%{keyword}%")))
     if status: q=q.filter(Animal.status==status)
     total=q.count(); items=q.order_by(Animal.id.desc()).offset((page-1)*limit).limit(limit).all()
@@ -543,7 +643,8 @@ def delete_growth(id:int,user=Depends(current),s:Session=Depends(db)):
 # -------------------- Export CRUD --------------------
 @app.get("/api/exports")
 def list_exports(user=Depends(current),s:Session=Depends(db)):
-    return [{"id":e.id,"animal_id":e.animal_id,"barn_id":(s.get(Animal,e.animal_id).barn_id if s.get(Animal,e.animal_id) else None),"quantity":e.quantity,"weight":e.weight,"total":e.total,"customer":e.customer,"exported_at":e.exported_at} for e in s.query(ExportBill).order_by(ExportBill.id.desc()).all()]
+    rows = s.query(ExportBill, Animal, Barn).outerjoin(Animal, ExportBill.animal_id == Animal.id).outerjoin(Barn, Animal.barn_id == Barn.id).order_by(ExportBill.id.desc()).all()
+    return [{"id": e.id, "animal_id": e.animal_id, "animal_code": a.code if a else str(e.animal_id), "species": a.species if a else "", "barn_id": a.barn_id if a else None, "barn_name": b.name if b else "", "quantity": e.quantity, "weight": e.weight, "total": e.total, "customer": e.customer, "exported_at": e.exported_at} for e, a, b in rows]
 
 @app.post("/api/exports")
 def add_export(x:ExportIn,user=Depends(current),s:Session=Depends(db)):
@@ -554,12 +655,12 @@ def add_export(x:ExportIn,user=Depends(current),s:Session=Depends(db)):
 # -------------------- Reports --------------------
 @app.get("/api/reports/health")
 def health_report(user=Depends(current),s:Session=Depends(db)):
-    rows=s.query(Animal.health,func.count(Animal.id)).filter(Animal.status!="da_xoa").group_by(Animal.health).all()
+    rows=s.query(Animal.health,func.count(Animal.id)).filter(Animal.status=="dang_nuoi").group_by(Animal.health).all()
     return [{"health":h,"count":c} for h,c in rows]
 
 @app.get("/api/reports/growth")
 def growth_report(user=Depends(current),s:Session=Depends(db)):
-    rows=s.query(Animal.species,func.avg(Animal.weight),func.count(Animal.id)).filter(Animal.status!="da_xoa").group_by(Animal.species).all()
+    rows=s.query(Animal.species,func.avg(Animal.weight),func.count(Animal.id)).filter(Animal.status=="dang_nuoi").group_by(Animal.species).all()
     return [{"species":sp,"average_weight":round(float(avg or 0),2),"count":count} for sp,avg,count in rows]
 
 @app.get("/api/reports/sales")
@@ -570,24 +671,12 @@ def sales_report(user=Depends(current),s:Session=Depends(db)):
     return {"bills":bills,"weight":float(weight),"revenue":float(total)}
 
 # -------------------- AI --------------------
-from .ai.context import build_farm_context
-from .ai.guardrails import sanitize_prompt, sanitize_output
+from .ai.guardrails import sanitize_prompt, sanitize_output, normalize_question
 from .ai.llm import call_openai
-from .ai.prompts import SYSTEM_PROMPT, build_analyze_prompt, build_summary_prompt
 
 # Lightweight per-user cooldown to protect the provider and demonstrate rate-limit handling.
 _ai_last_request = {}
 AI_COOLDOWN_SECONDS = float(os.getenv("AI_COOLDOWN_SECONDS", "2"))
-
-def build_ai_fallback(prompt: str, s: Session) -> str:
-    context = build_farm_context(s)
-    return (
-        f"Tóm tắt theo yêu cầu: {prompt}\n\n"
-        f"{context}\n"
-        "Khuyến nghị: kiểm tra các trường hợp sức khỏe bất thường, theo dõi vaccine đúng lịch, "
-        "ghi tăng trưởng định kỳ và đối chiếu tồn kho thức ăn. AI chỉ hỗ trợ phân tích, "
-        "không thay thế bác sĩ thú y/kỹ thuật viên."
-    )
 
 def check_ai_rate_limit(user_id: int):
     now = datetime.utcnow().timestamp()
@@ -596,45 +685,79 @@ def check_ai_rate_limit(user_id: int):
         raise HTTPException(429, f"Vui lòng chờ {AI_COOLDOWN_SECONDS:g} giây trước khi gửi yêu cầu AI tiếp theo")
     _ai_last_request[user_id] = now
 
+from .ai.workspace import catalog as ai_catalog, respond as workspace_respond
+from .ai import llm as ai_provider
+from .ai.reports import is_report_request, system_report
+
+@app.get("/api/ai/capabilities")
+def ai_capabilities(user=Depends(current)):
+    return {"configured": bool(ai_provider.OPENAI_API_KEY), "read_only": True, "system_reports": True,
+            "pages": ai_catalog(user)}
+
+from .ai.analytics import snapshot as farm_snapshot, growth as farm_growth, answer as farm_answer, bounded_context
+from .ai.prompts import SYSTEM_PROMPT, build_analyze_prompt
+from .ai.context import build_farm_context
+
+@app.get("/api/ai/alerts")
+def ai_alerts(user=Depends(current), s:Session=Depends(db)):
+    ai_catalog(user)
+    alerts = farm_snapshot(s)['alerts']
+    return {"total":len(alerts), "alerts":alerts}
+
+@app.get("/api/ai/growth/{animal_id}")
+def ai_growth(animal_id:int, user=Depends(current), s:Session=Depends(db)):
+    ai_catalog(user)
+    return farm_growth(s, animal_id)
+
 @app.post("/api/ai/summary")
 def ai_summary(user=Depends(current), s:Session=Depends(db)):
-    check_ai_rate_limit(user.id)
-    context = build_farm_context(s)
-    prompt = build_summary_prompt(context)
-    try:
-        text, mode = call_openai(SYSTEM_PROMPT, prompt)
-    except Exception:
-        text = build_ai_fallback("Tổng hợp tình hình đàn và đưa ra khuyến nghị chăm sóc.", s)
-        mode = "fallback"
-    text = sanitize_output(text)
-    s.add(AIRequest(user_id=user.id, request="summary", response=text, mode=mode)); s.commit()
-    return {"mode": mode, "summary": text, "context_chars": len(context)}
+    result = ai_analyze(AIIn(prompt="Tóm tắt hôm nay", page="dashboard"), user, s, summary=True)
+    return {**result, "summary":result['answer']}
 
 @app.post("/api/ai/analyze")
-def ai_analyze(x:AIIn, user=Depends(current), s:Session=Depends(db)):
+def ai_analyze(x:AIIn, user=Depends(current), s:Session=Depends(db), summary:bool=False):
+    ai_catalog(user)
     check_ai_rate_limit(user.id)
     try:
-        user_prompt = sanitize_prompt(x.prompt)
+        question = sanitize_prompt(x.prompt)
+        history = [{"role":m.role, "content":sanitize_prompt(m.content) if m.role=='user' else sanitize_output(m.content)} for m in x.messages]
     except ValueError as exc:
         raise HTTPException(422, str(exc))
+    data = farm_snapshot(s)
+    internal = farm_answer(question, data, s, summary=summary or 'tom tat' in normalize_question(question))
+    result = {"answer":internal, "mode":"fallback", "sources":[p for p in ai_catalog(user) if p['page']=='reports']}
+    # Structured, bounded facts only; arithmetic and fallback never depend on a model.
+    context = build_farm_context(s, data)
+    if ai_provider.OPENAI_API_KEY:
+        try:
+            normalized = normalize_question(question)
+            if summary or any(term in normalized for term in ('tom tat', 'uu tien', 'bao cao')) or ('tang truong' in normalized and 'bao nhieu' not in normalized):
+                response, _ = call_openai(SYSTEM_PROMPT, build_analyze_prompt(context, question) + "\nPHÂN TÍCH NỘI BỘ ĐÃ TÍNH:\n" + internal)
+                result.update(answer=sanitize_output(response), mode='ai')
+            else:
+                planned = workspace_respond(question, history, x.page, user, s, call_openai)
+                if planned['mode'] == 'openai':
+                    result.update(planned, mode='ai')
+                elif planned['mode'] in ('guide', 'clarify'):
+                    result.update(planned, mode='fallback')
 
-    context = build_farm_context(s)
-    prompt = build_analyze_prompt(context, user_prompt)
-    try:
-        text, mode = call_openai(SYSTEM_PROMPT, prompt)
-    except Exception:
-        text = build_ai_fallback(user_prompt, s)
-        mode = "fallback"
-
-    text = sanitize_output(text)
-    s.add(AIRequest(user_id=user.id, request=user_prompt, response=text, mode=mode)); s.commit()
-    return {"mode": mode, "answer": text, "context_chars": len(context)}
+        except (ai_provider.ProviderError, ai_provider.openai.APIError, TimeoutError, ValueError):
+            pass
+    query_type = 'summary' if summary else 'analyze'
+    s.add(AIRequest(user_id=user.id, request=question, response=result['answer'], mode=result['mode'], model=ai_provider.OPENAI_MODEL if result['mode']=='ai' else 'rules-v1', query_type=query_type, conversation_id=x.conversation_id or uuid.uuid4().hex))
+    s.commit()
+    return {**result, "context_chars":len(context), "query_type":query_type}
 
 @app.get("/api/ai/history")
 def ai_history(user=Depends(current), s:Session=Depends(db)):
-    # RBAC/data isolation: normal users only see their own AI history; Admin may review all.
-    q = s.query(AIRequest)
-    if user.role != "Admin":
-        q = q.filter(AIRequest.user_id == user.id)
+    # Every role, including Admin, sees only its own audit entries.
+    q = s.query(AIRequest).filter(AIRequest.user_id == user.id)
     rows = q.order_by(AIRequest.id.desc()).limit(100).all()
-    return [{"id":r.id,"user_id":r.user_id,"request":r.request,"response":r.response,"mode":r.mode,"created_at":r.created_at} for r in rows]
+    return [{"id":r.id,"user_id":r.user_id,"request":sanitize_output(r.request) if r.model else "Yêu cầu cũ (không lưu nội dung)","prompt":sanitize_output(r.request) if r.model else "Yêu cầu cũ (không lưu nội dung)","response":sanitize_output(r.response) if r.model else "Không hiển thị nội dung hội thoại cũ","mode":r.mode,"status":"success" if r.mode=='ai' else 'fallback',"model":r.model,"query_type":r.query_type,"conversation_id":r.conversation_id or str(r.id),"created_at":r.created_at} for r in rows]
+
+@app.delete("/api/ai/conversations/{conversation_id}")
+def delete_ai_conversation(conversation_id:str, user=Depends(current), s:Session=Depends(db)):
+    ai_catalog(user)
+    removed=s.query(AIRequest).filter(AIRequest.user_id==user.id, AIRequest.conversation_id==conversation_id).delete(synchronize_session=False)
+    s.commit()
+    return {"deleted":removed}

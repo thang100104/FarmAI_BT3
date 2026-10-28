@@ -3,7 +3,6 @@
 ## Chạy bằng Docker
 
 ```bash
-docker compose down -v
 docker compose up --build
 ```
 
@@ -65,3 +64,15 @@ pytest -q tests
 
 Không có `OPENAI_API_KEY`: hệ thống vẫn chạy bằng fallback để demo chức năng.
 Có API key ở backend: endpoint `/api/ai/analyze` và `/api/ai/summary` gọi provider thật.
+
+## Bản hoàn thiện cuối học phần
+
+Bản này đã được đồng bộ thêm theo quyển báo cáo cuối học phần: phân quyền UI, quản lý tài khoản Admin, tìm kiếm/lọc/phân trang, phân chia khu vực chuồng, kho thức ăn, cảnh báo, lịch sử AI và cấu hình deploy Render.
+
+Xem hướng dẫn cloud: `DEPLOY_RENDER.md`.
+
+## AI phân tích dữ liệu và fallback
+
+Đã bổ sung `GET /api/ai/alerts`, `GET /api/ai/growth/{animal_id}`, hội thoại riêng theo tài khoản và phân tích nội bộ khi thiếu key/hết quota/timeout. Không bắt buộc `OPENAI_API_KEY` để phân tích dữ liệu trang trại. Backend trả `mode=ai` hoặc `mode=fallback`.
+
+Xem quy tắc tính toán, giới hạn dữ liệu, các API và cách chạy tại [docs/AI_UPGRADE.md](docs/AI_UPGRADE.md). Không xóa volume PostgreSQL khi cập nhật.
